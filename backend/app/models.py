@@ -13,8 +13,9 @@ class EdgeAnnotation(BaseModel):
     id: str
     start_idx: int
     end_idx: int
-    edge_type: str = "fracture"  # "fracture", "original_vessel_edge", "unknown"
+    edge_type: str = "fracture"  # "fracture", "original_vessel_edge", "original_sheet_edge", "cut_torn_edge", "unknown"
     label: Optional[str] = None
+    points: Optional[List[List[float]]] = None
 
 class VisibleObservations(BaseModel):
     color_desc: Optional[str] = None
@@ -30,6 +31,7 @@ class FragmentPlacement(BaseModel):
     y: float = 0.0
     rotation_deg: float = 0.0
     locked: bool = False
+    placed_in_assembly: bool = True
 
 class FragmentFeatures(BaseModel):
     mean_rgb: Optional[List[float]] = None
@@ -96,7 +98,11 @@ class JoinCandidate(BaseModel):
     matched_length_mm: Optional[float] = None
     tangent_score: float  # 0 to 1, higher is better
     overlap_penalty: float  # 0 to 1, lower is better (0 = no collision)
-    compatibility_score: float  # 0 to 1 composite metric
+    compatibility_score: float  # 0 to 1 composite metric (relative compatibility score)
+    seam_color_score: Optional[float] = None  # Optional secondary color/pattern continuity score across seam
+    is_ambiguous: bool = False
+    ambiguity_warning: Optional[str] = None
+    rank_for_pair: int = 1
     status: str = "suggested"  # "suggested", "accepted", "rejected"
     explanation: str
 
@@ -144,6 +150,8 @@ class Project(BaseModel):
     id: str
     name: str
     description: Optional[str] = None
+    mode: str = "ceramic"  # "ceramic" | "paper"
+    demo_type: Optional[str] = None  # "ceramic_demo" | "paper_demo" | "paper_ambiguous" | None
     status: str = "draft"  # "draft" | "approved"
     created_at: str
     updated_at: str
@@ -152,6 +160,7 @@ class Project(BaseModel):
     calibration: CalibrationData = Field(default_factory=CalibrationData)
     primary_photo_url: Optional[str] = None
     primary_photo_dimensions: Optional[List[int]] = None  # [width, height]
+    assembly_metadata: Optional[Dict[str, Any]] = None
 
 class ReviewSnapshot(BaseModel):
     id: str

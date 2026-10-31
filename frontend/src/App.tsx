@@ -1,5 +1,14 @@
 import React, { useState, useEffect } from 'react';
-import { Project, ProjectState, HealthInfo, Fragment, VesselGroup, JoinCandidate, ReconstructionProfile, CalibrationData } from './types';
+import {
+  Project,
+  ProjectState,
+  HealthInfo,
+  Fragment,
+  VesselGroup,
+  JoinCandidate,
+  ReconstructionProfile,
+  CalibrationData,
+} from './types';
 import { api } from './api';
 import { Header } from './components/Header';
 import { WorkflowNav, WorkflowStep } from './components/WorkflowNav';
@@ -11,6 +20,8 @@ import { ReconstructView } from './components/views/ReconstructView';
 import { TypologyView } from './components/views/TypologyView';
 import { ReviewView } from './components/views/ReviewView';
 import { EvaluationChecklistModal } from './components/EvaluationChecklistModal';
+import { ApiKeyModal } from './components/ApiKeyModal';
+import { Plus, X } from 'lucide-react';
 
 export const App: React.FC = () => {
   const [health, setHealth] = useState<HealthInfo | null>(null);
@@ -20,7 +31,14 @@ export const App: React.FC = () => {
   const [currentStep, setCurrentStep] = useState<WorkflowStep>('capture');
   const [selectedFragmentId, setSelectedFragmentId] = useState<string | null>(null);
   const [isChecklistOpen, setIsChecklistOpen] = useState<boolean>(false);
+  const [isApiKeyModalOpen, setIsApiKeyModalOpen] = useState<boolean>(false);
   const [isSaving, setIsSaving] = useState<boolean>(false);
+
+  // Non-blocking New Project Modal state (replaces window.prompt)
+  const [isNewProjectModalOpen, setIsNewProjectModalOpen] = useState<boolean>(false);
+  const [newProjectName, setNewProjectName] = useState<string>('New Pottery Project');
+  const [newProjectDesc, setNewProjectDesc] = useState<string>('');
+  const [isCreatingProject, setIsCreatingProject] = useState<boolean>(false);
 
   // Initialize
   useEffect(() => {
@@ -49,31 +67,44 @@ export const App: React.FC = () => {
     }
   };
 
-  const selectProject = async (projId: string) => {
+  const selectProject = async (projId: string, preserveStep: boolean = false) => {
     setCurrentProjectId(projId);
     setSelectedFragmentId(null);
     try {
       const state = await api.getProjectState(projId);
       setProjectState(state);
-      // Auto-advance step based on project data completeness
-      if (state.fragments.length > 0) {
-        setCurrentStep('group');
-      } else {
-        setCurrentStep('capture');
+      if (!preserveStep) {
+        if (state.fragments.length > 0) {
+          setCurrentStep('group');
+        } else {
+          setCurrentStep('capture');
+        }
       }
     } catch (e) {
       console.error(e);
     }
   };
 
-  const handleCreateProject = async () => {
-    const name = prompt('Enter project name:', 'New Pottery Project') || 'New Pottery Project';
+  const handleOpenCreateProject = () => {
+    setNewProjectName(`Excavation Lot #${projects.length + 1}`);
+    setNewProjectDesc('');
+    setIsNewProjectModalOpen(true);
+  };
+
+  const handleConfirmCreateProject = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const trimmed = newProjectName.trim() || 'New Pottery Project';
+    setIsCreatingProject(true);
     try {
-      const p = await api.createProject(name);
+      const p = await api.createProject(trimmed, newProjectDesc.trim());
       setProjects((prev) => [p, ...prev]);
-      selectProject(p.id);
+      setIsNewProjectModalOpen(false);
+      await selectProject(p.id, true);
+      setCurrentStep('capture');
     } catch (err: any) {
-      alert(`Could not create project: ${err.message}`);
+      console.error('Could not create project:', err);
+    } finally {
+      setIsCreatingProject(false);
     }
   };
 
@@ -85,30 +116,54 @@ export const App: React.FC = () => {
       await selectProject(res.project_id);
       setCurrentStep('group');
     } catch (err: any) {
-      alert(`Could not load demonstration: ${err.message}`);
+      console.error('Could not load demonstration:', err);
     }
   };
 
-  const handlePhotoUploaded = async (url: string, dims: [number, number]) => {
+  const handlePhotoUploaded = async (
+    url: string,
+    dims: [number, number],
+    fragments?: Fragment[],
+    groups?: VesselGroup[],
+    calibration?: CalibrationData
+  ) => {
     if (!projectState) return;
     const updatedProject: Project = {
       ...projectState.project,
       primary_photo_url: url,
       primary_photo_dimensions: dims,
+      calibration: calibration || projectState.project.calibration,
     };
     setProjectState({
       ...projectState,
       project: updatedProject,
+      fragments: fragments ?? [],
+      groups: groups ?? [],
+      joins: [],
     });
+    setSelectedFragmentId(null);
     setProjects((prev) => prev.map((p) => (p.id === updatedProject.id ? updatedProject : p)));
-    setCurrentStep('group');
+    // Refresh full state from backend to ensure complete sync while remaining on Capture view for calibration
+    try {
+      const freshState = await api.getProjectState(updatedProject.id);
+      setProjectState(freshState);
+    } catch (e) {
+      console.warn('Could not refresh project state after upload:', e);
+    }
   };
 
-  const handleCalibrationUpdated = (calib: CalibrationData) => {
+  const handleCalibrationUpdated = async (calib: CalibrationData) => {
     if (!projectState) return;
     const updatedProj = { ...projectState.project, calibration: calib };
     setProjectState({ ...projectState, project: updatedProj });
     setProjects((prev) => prev.map((p) => (p.id === updatedProj.id ? updatedProj : p)));
+    // Refresh fragments so updated mm2 / mm measurements are reflected
+    try {
+      const freshState = await api.getProjectState(updatedProj.id);
+      setProjectState(freshState);
+    } catch {
+      // Ignore refresh warning
+    }
   };
 
   const handleFragmentsUpdated = (frags: Fragment[]) => {
@@ -165,10 +220,11 @@ export const App: React.FC = () => {
         currentProject={projectState?.project || null}
         projects={projects}
         health={health}
-        onSelectProject={selectProject}
-        onCreateProject={handleCreateProject}
+        onSelectProject={(id) => selectProject(id)}
+        onCreateProject={handleOpenCreateProject}
         onLoadDemo={handleLoadDemo}
         onOpenChecklist={() => setIsChecklistOpen(true)}
+        onOpenApiKeyModal={() => setIsApiKeyModalOpen(true)}
         isSaving={isSaving}
       />
 
@@ -193,6 +249,7 @@ export const App: React.FC = () => {
             {currentStep === 'capture' && (
               <CaptureView
                 project={projectState.project}
+                fragmentCount={projectState.fragments.length}
                 onPhotoUploaded={handlePhotoUploaded}
                 onCalibrationUpdated={handleCalibrationUpdated}
                 onNextStep={() => setCurrentStep('group')}
@@ -267,7 +324,7 @@ export const App: React.FC = () => {
                 api.updateFragment(projectState.project.id, f);
               }}
               onDeselect={() => setSelectedFragmentId(null)}
-              onPhotoUploaded={() => selectProject(projectState.project.id)}
+              onPhotoUploaded={() => selectProject(projectState.project.id, true)}
             />
           </>
         ) : (
@@ -276,6 +333,70 @@ export const App: React.FC = () => {
           </div>
         )}
       </div>
+
+      {/* Create New Project Modal */}
+      {isNewProjectModalOpen && (
+        <div className="fixed inset-0 z-50 bg-charcoal-900/70 flex items-center justify-center p-4">
+          <form
+            onSubmit={handleConfirmCreateProject}
+            className="bg-parchment-50 border border-parchment-300 rounded-xl shadow-xl max-w-md w-full overflow-hidden"
+          >
+            <div className="bg-parchment-100 border-b border-parchment-300 px-5 py-3.5 flex items-center justify-between">
+              <div className="flex items-center space-x-2">
+                <Plus className="w-4 h-4 text-terracotta-600" />
+                <h3 className="text-sm font-bold text-charcoal-900">Create New Pottery Project</h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsNewProjectModalOpen(false)}
+                className="p-1 text-charcoal-500 hover:text-charcoal-900 rounded"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <div className="p-5 space-y-4 text-xs">
+              <div>
+                <label className="block font-semibold text-charcoal-700 mb-1">Project / Context Name</label>
+                <input
+                  type="text"
+                  autoFocus
+                  required
+                  value={newProjectName}
+                  onChange={(e) => setNewProjectName(e.target.value)}
+                  placeholder="e.g. Trench 4 — Context 108 Ceramic Scatter"
+                  className="w-full bg-white border border-parchment-300 rounded-md px-3 py-2 text-charcoal-900 focus:outline-none focus:ring-1 focus:ring-terracotta-500"
+                />
+              </div>
+              <div>
+                <label className="block font-semibold text-charcoal-700 mb-1">Excavation Notes (Optional)</label>
+                <textarea
+                  rows={2}
+                  value={newProjectDesc}
+                  onChange={(e) => setNewProjectDesc(e.target.value)}
+                  placeholder="Tabletop scatter with calibration scale bar..."
+                  className="w-full bg-white border border-parchment-300 rounded-md px-3 py-2 text-charcoal-900 focus:outline-none focus:ring-1 focus:ring-terracotta-500"
+                />
+              </div>
+            </div>
+            <div className="bg-parchment-100 border-t border-parchment-300 px-5 py-3 flex items-center justify-end space-x-2">
+              <button
+                type="button"
+                onClick={() => setIsNewProjectModalOpen(false)}
+                className="text-xs text-charcoal-600 hover:text-charcoal-900 px-3 py-1.5 rounded-md font-medium"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                disabled={isCreatingProject}
+                className="bg-terracotta-600 hover:bg-terracotta-700 disabled:opacity-50 text-white text-xs font-semibold px-4 py-2 rounded-md shadow-xs transition cursor-pointer"
+              >
+                {isCreatingProject ? 'Creating...' : 'Create & Open Capture'}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
 
       {/* Evaluation Checklist Modal */}
       <EvaluationChecklistModal
@@ -290,6 +411,14 @@ export const App: React.FC = () => {
           isApproved: projectState?.project.status === 'approved',
           isOfflineSupported: true,
         }}
+      />
+
+      {/* Gemini API Key Modal */}
+      <ApiKeyModal
+        isOpen={isApiKeyModalOpen}
+        onClose={() => setIsApiKeyModalOpen(false)}
+        health={health}
+        onHealthUpdated={(updated) => setHealth(updated)}
       />
     </div>
   );

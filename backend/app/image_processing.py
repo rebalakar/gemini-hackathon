@@ -77,9 +77,11 @@ def extract_features(img_bgr: np.ndarray, mask: np.ndarray) -> FragmentFeatures:
         texture_roughness=round(roughness, 2)
     )
 
-def generate_crop_png(img_bgr: np.ndarray, contour: np.ndarray, project_id: str, frag_id: str) -> str:
+def generate_crop_and_mask_png(img_bgr: np.ndarray, contour: np.ndarray, project_id: str, frag_id: str) -> Tuple[str, str]:
     """
-    Crops the fragment bounding box and writes a transparent PNG (BGRA) with alpha channel masking the contour.
+    Crops the fragment bounding box and writes both:
+    1. A transparent PNG (BGRA) with alpha channel masking the contour.
+    2. A binary mask PNG for inspection and verification.
     """
     x, y, w, h = cv2.boundingRect(contour)
     # Add small padding if within image bounds
@@ -104,20 +106,178 @@ def generate_crop_png(img_bgr: np.ndarray, contour: np.ndarray, project_id: str,
     bgra = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2BGRA)
     bgra[:, :, 3] = local_mask
 
-    filename = f"{project_id}_{frag_id}_crop.png"
-    filepath = UPLOAD_DIR / filename
-    cv2.imwrite(str(filepath), bgra)
-    return f"/uploads/{filename}"
+    crop_filename = f"{project_id}_{frag_id}_crop.png"
+    crop_filepath = UPLOAD_DIR / crop_filename
+    cv2.imwrite(str(crop_filepath), bgra)
+
+    mask_filename = f"{project_id}_{frag_id}_mask.png"
+    mask_filepath = UPLOAD_DIR / mask_filename
+    cv2.imwrite(str(mask_filepath), local_mask)
+
+    return f"/uploads/{crop_filename}", f"/uploads/{mask_filename}"
+
+def generate_crop_png(img_bgr: np.ndarray, contour: np.ndarray, project_id: str, frag_id: str) -> str:
+    crop_url, _ = generate_crop_and_mask_png(img_bgr, contour, project_id, frag_id)
+    return crop_url
+
+
+def extract_contour_subpath(contour_coords: List[List[float]], start_idx: int, end_idx: int) -> List[List[float]]:
+    """
+    Extracts ordered points along the closed contour from start_idx to end_idx (wrapping around if start_idx > end_idx).
+    """
+    n = len(contour_coords)
+    if n == 0:
+        return []
+    s = max(0, min(n - 1, int(start_idx)))
+    e = max(0, min(n - 1, int(end_idx)))
+    if s <= e:
+        return contour_coords[s : e + 1]
+    else:
+        return contour_coords[s:] + contour_coords[: e + 1]
+
+
+def _point_along_closed_polygon(pts: np.ndarray, start_vertex: int, signed_dist: float) -> np.ndarray:
+    """
+    Walks `abs(signed_dist)` pixels forward (signed_dist > 0) or backward (signed_dist < 0)
+    along the closed polygon `pts` starting from `pts[start_vertex]`.
+    """
+    n = len(pts)
+    rem = abs(float(signed_dist))
+    step = 1 if signed_dist >= 0 else -1
+    curr_idx = start_vertex % n
+    for _ in range(n):
+        next_idx = (curr_idx + step) % n
+        p0 = pts[curr_idx]
+        p1 = pts[next_idx]
+        seg_len = float(np.linalg.norm(p1 - p0))
+        if seg_len >= rem and seg_len > 1e-6:
+            return p0 + (rem / seg_len) * (p1 - p0)
+        rem -= seg_len
+        curr_idx = next_idx
+    return pts[curr_idx]
+
+
+def auto_classify_paper_edges(contour_coords: List[List[float]]) -> List[EdgeAnnotation]:
+    """
+    Partitions a piece contour at high-curvature corners (measured using fixed arc-length arms
+    so single-segment approxPolyDP edges are never skipped) and classifies straight segments
+    as 'original_sheet_edge' and irregular/wavy segments as 'cut_torn_edge'.
+    """
+    pts = np.array(contour_coords, dtype=np.float64)
+    n = len(pts)
+    if n < 3:
+        return []
+
+    # Compute cumulative arc length along the closed polygon
+    seg_lengths = np.array([
+        float(np.linalg.norm(pts[(i + 1) % n] - pts[i]))
+        for i in range(n)
+    ], dtype=np.float64)
+    total_perim = float(np.sum(seg_lengths))
+    if total_perim < 40.0:
+        return []
+    cum_arc = np.concatenate([[0.0], np.cumsum(seg_lengths[:-1])])
+
+    arm_px = min(26.0, max(12.0, total_perim * 0.04))
+    raw_corners = []
+    for i in range(n):
+        p_curr = pts[i]
+        p_prev = _point_along_closed_polygon(pts, i, -arm_px)
+        p_next = _point_along_closed_polygon(pts, i, +arm_px)
+        v1 = p_curr - p_prev
+        v2 = p_next - p_curr
+        n1 = float(np.linalg.norm(v1))
+        n2 = float(np.linalg.norm(v2))
+        if n1 < 1e-3 or n2 < 1e-3:
+            continue
+        cos_ang = np.clip(np.dot(v1, v2) / (n1 * n2), -1.0, 1.0)
+        angle_deg = float(np.degrees(np.arccos(cos_ang)))
+        if angle_deg >= 42.0:
+            raw_corners.append((i, angle_deg, float(cum_arc[i])))
+
+    # Non-maximum suppression within 32px arc-length window
+    raw_corners.sort(key=lambda x: x[1], reverse=True)
+    selected_corners = []
+    for idx_v, ang, arc_pos in raw_corners:
+        too_close = False
+        for sel_idx, _, sel_arc in selected_corners:
+            arc_diff = abs(arc_pos - sel_arc)
+            arc_dist = min(arc_diff, total_perim - arc_diff)
+            if arc_dist < 32.0:
+                too_close = True
+                break
+        if not too_close:
+            selected_corners.append((idx_v, ang, arc_pos))
+
+    selected_corners.sort(key=lambda x: x[0])
+    corner_indices = [c[0] for c in selected_corners]
+
+    if len(corner_indices) < 2:
+        corner_indices = [0, max(1, n // 3), max(2, (2 * n) // 3)]
+
+    annotations: List[EdgeAnnotation] = []
+    num_c = len(corner_indices)
+    for k in range(num_c):
+        s_idx = int(corner_indices[k])
+        e_idx = int(corner_indices[(k + 1) % num_c])
+        sub_pts = extract_contour_subpath(contour_coords, s_idx, e_idx)
+        if len(sub_pts) < 2:
+            continue
+        arr = np.array(sub_pts, dtype=np.float64)
+        chord = arr[-1] - arr[0]
+        chord_len = float(np.linalg.norm(chord))
+        if chord_len < 25.0:
+            continue
+
+        arc_len = float(np.sum(np.linalg.norm(np.diff(arr, axis=0), axis=1)))
+
+        # Perpendicular deviation of intermediate points from the straight chord
+        if len(arr) > 2:
+            unit_chord = chord / chord_len
+            normal = np.array([-unit_chord[1], unit_chord[0]])
+            rel = arr - arr[0]
+            devs = np.abs(rel @ normal)
+            max_dev = float(np.max(devs))
+            rms_dev = float(np.sqrt(np.mean(devs ** 2)))
+        else:
+            max_dev = 0.0
+            rms_dev = 0.0
+
+        is_straight = (
+            max_dev < 2.2
+            and rms_dev < 1.25
+            and chord_len >= 60.0
+            and (arc_len / max(1.0, chord_len)) < 1.015
+        )
+        edge_type = "original_sheet_edge" if is_straight else "cut_torn_edge"
+        label = (
+            f"Original Sheet Edge ({chord_len:.0f}px, dev {rms_dev:.1f}px)"
+            if is_straight
+            else f"Cut/Torn Edge ({chord_len:.0f}px, dev {rms_dev:.1f}px)"
+        )
+        annotations.append(EdgeAnnotation(
+            id=f"edge_{k + 1}",
+            start_idx=s_idx,
+            end_idx=e_idx,
+            edge_type=edge_type,
+            label=label,
+            points=sub_pts
+        ))
+    return annotations
+
 
 def detect_fragments_in_image(
     image_path: Path,
     project_id: str,
     sensitivity: float = 1.0,
     existing_fragments: Optional[List[Fragment]] = None,
-    px_per_mm: Optional[float] = None
+    px_per_mm: Optional[float] = None,
+    mode: str = "ceramic",
+    background_polarity: str = "auto"
 ) -> List[Fragment]:
     """
-    Segments individual pottery fragments from a plain background photograph using color difference and adaptive thresholding.
+    Segments individual pottery fragments or paper puzzle pieces from a plain background photograph.
+    Supports both light pieces on a dark background and dark pieces on a light background.
     """
     img = cv2.imread(str(image_path))
     if img is None:
@@ -126,40 +286,65 @@ def detect_fragments_in_image(
     h, w = img.shape[:2]
     total_area = h * w
 
-    # Estimate background color
+    # Estimate background color in LAB space from image border strips
     bg_lab = estimate_background_color(img)
     img_lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
 
     # Calculate Euclidean distance in LAB space (Delta E)
     diff = img_lab.astype(np.float32) - bg_lab.astype(np.float32)
-    dist = np.sqrt(np.sum(diff ** 2, axis=2))
+    dist_lab = np.sqrt(np.sum(diff ** 2, axis=2))
 
-    # Delta E threshold modulated by sensitivity:
-    # Baseline Delta E of 22.0 is clearly perceptible against plain studio background
-    thresh_val = 22.0 / max(0.2, sensitivity)
+    bg_l = float(bg_lab[0])
+    img_l = img_lab[:, :, 0].astype(np.float32)
+
+    if background_polarity == "dark_bg":
+        # Light paper/pieces on dark background
+        l_pos = np.clip(img_l - bg_l, 0, 255)
+        dist = np.maximum(l_pos * 1.15, dist_lab * 0.85)
+    elif background_polarity == "light_bg":
+        # Dark paper/pieces on light background
+        l_neg = np.clip(bg_l - img_l, 0, 255)
+        dist = np.maximum(l_neg * 1.15, dist_lab * 0.85)
+    else:
+        if mode == "paper":
+            # Auto-detect contrast polarity from luminance and LAB color difference
+            l_abs = np.abs(img_l - bg_l)
+            dist = np.maximum(dist_lab, l_abs * 1.05)
+        else:
+            dist = dist_lab
+
+    # Threshold modulated by sensitivity
+    base_thresh = 20.0 if mode == "paper" else 24.0
+    thresh_val = base_thresh / max(0.2, sensitivity)
     binary = (dist >= thresh_val).astype(np.uint8) * 255
 
-    # Morphological cleanup
-    kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+    # Morphological cleanup (finer kernel in paper mode to preserve sharp corners and jagged tear teeth)
+    if mode == "paper":
+        kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    else:
+        kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+
     cleaned = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel_open)
     cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel_close)
 
     # Extract external contours
-    contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_TC89_KCOS)
+    contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE if mode == "paper" else cv2.CHAIN_APPROX_TC89_KCOS)
 
     # Size filtering: min area is 0.05% of image, max area is 85% of image
-    min_area = total_area * 0.0005
+    min_area = total_area * (0.0008 if mode == "paper" else 0.0005)
     max_area = total_area * 0.85
 
     valid_contours = []
     for cnt in contours:
         area = cv2.contourArea(cnt)
         if min_area <= area <= max_area:
-            # Check aspect ratio to avoid long thin calibration rulers (aspect ratio > 7:1)
             x, y, cw, ch = cv2.boundingRect(cnt)
             aspect = max(cw, ch) / max(1, min(cw, ch))
-            if aspect < 8.0:
+            # Paper strips can be somewhat elongated, ceramic avoids >4.5:1 calibration ruler bars
+            max_aspect = 12.0 if mode == "paper" else 4.5
+            if aspect < max_aspect:
                 valid_contours.append(cnt)
 
     # Sort contours by spatial position (top-to-bottom, left-to-right) for stable indexing
@@ -176,9 +361,10 @@ def detect_fragments_in_image(
 
     fragments: List[Fragment] = []
     existing_map = {f.id: f for f in (existing_fragments or [])}
+    id_prefix = "P" if mode == "paper" else "S"
 
     for idx, cnt in enumerate(valid_contours):
-        frag_id = f"S{idx + 1}"
+        frag_id = f"{id_prefix}{idx + 1}"
         x, y, bw, bh = cv2.boundingRect(cnt)
         M = cv2.moments(cnt)
         if M["m00"] != 0:
@@ -187,20 +373,23 @@ def detect_fragments_in_image(
         else:
             cx, cy = float(x + bw / 2), float(y + bh / 2)
 
+        bbox_cx = float(x + bw / 2.0)
+        bbox_cy = float(y + bh / 2.0)
+
         area_px = float(cv2.contourArea(cnt))
         perimeter_px = float(cv2.arcLength(cnt, True))
 
-        area_mm2 = round(area_px / (px_per_mm ** 2), 2) if px_per_mm else None
-        perimeter_mm = round(perimeter_px / px_per_mm, 2) if px_per_mm else None
+        area_mm2 = round(area_px / (px_per_mm ** 2), 2) if (px_per_mm and mode != "paper") else None
+        perimeter_mm = round(perimeter_px / px_per_mm, 2) if (px_per_mm and mode != "paper") else None
 
-        # Simplified contour coordinates for frontend rendering
-        # Douglas-Peucker epsilon
-        epsilon = 0.002 * perimeter_px
+        # Simplified contour coordinates (finer epsilon in paper mode to preserve tear geometry)
+        eps_factor = 0.0012 if mode == "paper" else 0.002
+        epsilon = eps_factor * perimeter_px
         approx_cnt = cv2.approxPolyDP(cnt, epsilon, True)
-        contour_coords = [[float(pt[0][0]), float(pt[0][1])] for pt in approx_cnt]
+        contour_coords = [[round(float(pt[0][0]), 2), round(float(pt[0][1]), 2)] for pt in approx_cnt]
 
-        # Transparent crop PNG
-        crop_url = generate_crop_png(img, cnt, project_id, frag_id)
+        # Transparent crop PNG and binary mask PNG
+        crop_url, mask_url = generate_crop_and_mask_png(img, cnt, project_id, frag_id)
 
         # Feature mask
         mask = np.zeros((h, w), dtype=np.uint8)
@@ -209,10 +398,18 @@ def detect_fragments_in_image(
 
         # Preserve existing user annotations/observations if re-running
         prev_obs = existing_map.get(frag_id).observations if frag_id in existing_map else VisibleObservations()
-        prev_group = existing_map.get(frag_id).group_id if frag_id in existing_map else None
+        prev_group = existing_map.get(frag_id).group_id if frag_id in existing_map else ("PAPER_SHEET" if mode == "paper" else None)
         prev_locked = existing_map.get(frag_id).locked_group if frag_id in existing_map else False
-        prev_placement = existing_map.get(frag_id).placement if frag_id in existing_map else FragmentPlacement(x=cx, y=cy)
-        prev_edges = existing_map.get(frag_id).edge_annotations if frag_id in existing_map else []
+        prev_placement = (
+            existing_map.get(frag_id).placement
+            if frag_id in existing_map
+            else FragmentPlacement(x=round(bbox_cx, 1), y=round(bbox_cy, 1), rotation_deg=0.0, locked=False, placed_in_assembly=True)
+        )
+        prev_edges = (
+            existing_map.get(frag_id).edge_annotations
+            if (frag_id in existing_map and existing_map.get(frag_id).edge_annotations)
+            else (auto_classify_paper_edges(contour_coords) if mode == "paper" else [])
+        )
 
         fragments.append(Fragment(
             id=frag_id,
@@ -225,6 +422,7 @@ def detect_fragments_in_image(
             area_mm2=area_mm2,
             perimeter_mm=perimeter_mm,
             crop_url=crop_url,
+            mask_url=mask_url,
             group_id=prev_group,
             locked_group=prev_locked,
             placement=prev_placement,
@@ -267,16 +465,18 @@ def create_or_update_fragment_from_polygon(
     area_mm2 = round(area_px / (px_per_mm ** 2), 2) if px_per_mm else None
     perimeter_mm = round(perimeter_px / px_per_mm, 2) if px_per_mm else None
 
-    crop_url = generate_crop_png(img, pts, project_id, frag_id)
+    crop_url, mask_url = generate_crop_and_mask_png(img, pts, project_id, frag_id)
 
     mask = np.zeros((h, w), dtype=np.uint8)
     cv2.drawContours(mask, [pts], -1, 255, -1)
     features = extract_features(img, mask)
 
+    bbox_cx = round(float(x + bw / 2.0), 1)
+    bbox_cy = round(float(y + bh / 2.0), 1)
     obs = existing_fragment.observations if existing_fragment else VisibleObservations()
-    group_id = existing_fragment.group_id if existing_fragment else None
+    group_id = existing_fragment.group_id if existing_fragment else ("PAPER_SHEET" if frag_id.startswith("P") else None)
     locked_group = existing_fragment.locked_group if existing_fragment else False
-    placement = existing_fragment.placement if existing_fragment else FragmentPlacement(x=cx, y=cy)
+    placement = existing_fragment.placement if existing_fragment else FragmentPlacement(x=bbox_cx, y=bbox_cy, rotation_deg=0.0, locked=False, placed_in_assembly=True)
     edges = existing_fragment.edge_annotations if existing_fragment else []
 
     return Fragment(
@@ -290,6 +490,7 @@ def create_or_update_fragment_from_polygon(
         area_mm2=area_mm2,
         perimeter_mm=perimeter_mm,
         crop_url=crop_url,
+        mask_url=mask_url,
         group_id=group_id,
         locked_group=locked_group,
         placement=placement,

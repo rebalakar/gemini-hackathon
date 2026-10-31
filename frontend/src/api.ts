@@ -6,10 +6,39 @@ import {
 
 const BASE_URL = '/api';
 
+async function extractErrorMessage(res: Response, fallback: string): Promise<string> {
+  try {
+    const err = await res.json();
+    if (typeof err?.detail === 'string') return err.detail;
+    if (Array.isArray(err?.detail) && err.detail.length > 0) {
+      return err.detail.map((e: any) => e.msg || JSON.stringify(e)).join('; ');
+    }
+    if (err?.message) return err.message;
+  } catch {
+    // Ignore JSON parse error
+  }
+  return `${fallback} (HTTP ${res.status})`;
+}
+
 export const api = {
   async getHealth(): Promise<HealthInfo> {
     const res = await fetch(`${BASE_URL}/health`);
     if (!res.ok) throw new Error('Health check failed');
+    return res.json();
+  },
+
+  async updateGeminiApiKey(apiKey: string, model?: string): Promise<{
+    gemini_available: boolean;
+    gemini_model: string;
+    mode: string;
+    message: string;
+  }> {
+    const res = await fetch(`${BASE_URL}/settings/gemini-key`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ api_key: apiKey, model: model || 'gemini-4-argon' }),
+    });
+    if (!res.ok) throw new Error(await extractErrorMessage(res, 'Failed to update Gemini API key'));
     return res.json();
   },
 
@@ -27,7 +56,7 @@ export const api = {
       method: 'POST',
       body: fd,
     });
-    if (!res.ok) throw new Error('Failed to create project');
+    if (!res.ok) throw new Error(await extractErrorMessage(res, 'Failed to create project'));
     return res.json();
   },
 
@@ -35,26 +64,34 @@ export const api = {
     const res = await fetch(`${BASE_URL}/projects/create-demo`, {
       method: 'POST',
     });
-    if (!res.ok) throw new Error('Failed to generate demonstration project');
+    if (!res.ok) throw new Error(await extractErrorMessage(res, 'Failed to generate demonstration project'));
     return res.json();
   },
 
   async getProjectState(projectId: string): Promise<ProjectState> {
     const res = await fetch(`${BASE_URL}/projects/${projectId}`);
-    if (!res.ok) throw new Error('Failed to fetch project state');
+    if (!res.ok) throw new Error(await extractErrorMessage(res, 'Failed to fetch project state'));
     return res.json();
   },
 
-  async uploadPhoto(projectId: string, file: File): Promise<{ primary_photo_url: string; dimensions: [number, number] }> {
+  async uploadPhoto(
+    projectId: string,
+    file: File
+  ): Promise<{
+    primary_photo_url: string;
+    dimensions: [number, number];
+    fragments?: Fragment[];
+    groups?: VesselGroup[];
+    calibration?: CalibrationData;
+  }> {
     const fd = new FormData();
-    fd.append('file', file);
+    fd.append('file', file, file.name || 'capture.png');
     const res = await fetch(`${BASE_URL}/projects/${projectId}/upload-photo`, {
       method: 'POST',
       body: fd,
     });
     if (!res.ok) {
-      const err = await res.json().catch(() => ({ detail: 'Upload failed' }));
-      throw new Error(err.detail || 'Failed to upload photo');
+      throw new Error(await extractErrorMessage(res, 'Failed to upload photo'));
     }
     return res.json();
   },
@@ -65,7 +102,7 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(calib),
     });
-    if (!res.ok) throw new Error('Failed to update calibration');
+    if (!res.ok) throw new Error(await extractErrorMessage(res, 'Failed to update calibration'));
     return res.json();
   },
 
@@ -74,8 +111,7 @@ export const api = {
       method: 'POST',
     });
     if (!res.ok) {
-      const err = await res.json().catch(() => ({ detail: 'Detection failed' }));
-      throw new Error(err.detail || 'Detection failed');
+      throw new Error(await extractErrorMessage(res, 'Detection failed'));
     }
     return res.json();
   },
@@ -86,7 +122,7 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ polygon }),
     });
-    if (!res.ok) throw new Error('Failed to add fragment polygon');
+    if (!res.ok) throw new Error(await extractErrorMessage(res, 'Failed to add fragment polygon'));
     return res.json();
   },
 
@@ -96,7 +132,7 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(fragment),
     });
-    if (!res.ok) throw new Error('Failed to update fragment');
+    if (!res.ok) throw new Error(await extractErrorMessage(res, 'Failed to update fragment'));
     return res.json();
   },
 
@@ -104,14 +140,14 @@ export const api = {
     const res = await fetch(`${BASE_URL}/projects/${projectId}/fragments/${fragId}`, {
       method: 'DELETE',
     });
-    if (!res.ok) throw new Error('Failed to delete fragment');
+    if (!res.ok) throw new Error(await extractErrorMessage(res, 'Failed to delete fragment'));
   },
 
   async aiAnalyzeFragment(projectId: string, fragId: string): Promise<any> {
     const res = await fetch(`${BASE_URL}/projects/${projectId}/fragments/${fragId}/ai-analyze`, {
       method: 'POST',
     });
-    if (!res.ok) throw new Error('AI analysis failed');
+    if (!res.ok) throw new Error(await extractErrorMessage(res, 'AI analysis failed'));
     return res.json();
   },
 
@@ -119,7 +155,7 @@ export const api = {
     const res = await fetch(`${BASE_URL}/projects/${projectId}/group?threshold=${threshold}`, {
       method: 'POST',
     });
-    if (!res.ok) throw new Error('Grouping failed');
+    if (!res.ok) throw new Error(await extractErrorMessage(res, 'Grouping failed'));
     return res.json();
   },
 
@@ -129,7 +165,7 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(groups),
     });
-    if (!res.ok) throw new Error('Failed to save groups');
+    if (!res.ok) throw new Error(await extractErrorMessage(res, 'Failed to save groups'));
     return res.json();
   },
 
@@ -137,7 +173,7 @@ export const api = {
     const res = await fetch(`${BASE_URL}/projects/${projectId}/suggest-joins?cross_groups=${crossGroups}`, {
       method: 'POST',
     });
-    if (!res.ok) throw new Error('Join suggestion failed');
+    if (!res.ok) throw new Error(await extractErrorMessage(res, 'Join suggestion failed'));
     return res.json();
   },
 
@@ -145,7 +181,7 @@ export const api = {
     const res = await fetch(`${BASE_URL}/projects/${projectId}/joins/${joinId}/status?status=${status}`, {
       method: 'POST',
     });
-    if (!res.ok) throw new Error('Failed to update join status');
+    if (!res.ok) throw new Error(await extractErrorMessage(res, 'Failed to update join status'));
     return res.json();
   },
 
@@ -156,15 +192,14 @@ export const api = {
       body: JSON.stringify({ points }),
     });
     if (!res.ok) {
-      const err = await res.json().catch(() => ({ detail: 'Rim fit failed' }));
-      throw new Error(err.detail || 'Rim arc fitting failed');
+      throw new Error(await extractErrorMessage(res, 'Rim arc fitting failed'));
     }
     return res.json();
   },
 
   async getReconstruction(projectId: string): Promise<ReconstructionProfile> {
     const res = await fetch(`${BASE_URL}/projects/${projectId}/reconstruction`);
-    if (!res.ok) throw new Error('Failed to get reconstruction');
+    if (!res.ok) throw new Error(await extractErrorMessage(res, 'Failed to get reconstruction'));
     return res.json();
   },
 
@@ -174,13 +209,13 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(profile),
     });
-    if (!res.ok) throw new Error('Failed to update reconstruction');
+    if (!res.ok) throw new Error(await extractErrorMessage(res, 'Failed to update reconstruction'));
     return res.json();
   },
 
   async getTypology(projectId: string): Promise<{ candidates: TypologyCandidate[]; schema: any; ai_explanation?: any }> {
     const res = await fetch(`${BASE_URL}/projects/${projectId}/typology`);
-    if (!res.ok) throw new Error('Failed to retrieve typology matches');
+    if (!res.ok) throw new Error(await extractErrorMessage(res, 'Failed to retrieve typology matches'));
     return res.json();
   },
 
@@ -190,13 +225,13 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ reviewer_name: reviewerName, notes }),
     });
-    if (!res.ok) throw new Error('Approval failed');
+    if (!res.ok) throw new Error(await extractErrorMessage(res, 'Approval failed'));
     return res.json();
   },
 
   async uploadAdditionalPhoto(projectId: string, file: File, role: string, fragmentId?: string, notes?: string): Promise<any> {
     const fd = new FormData();
-    fd.append('file', file);
+    fd.append('file', file, file.name || `${role}_capture.png`);
     fd.append('role', role);
     if (fragmentId) fd.append('fragment_id', fragmentId);
     if (notes) fd.append('notes', notes);
@@ -204,7 +239,7 @@ export const api = {
       method: 'POST',
       body: fd,
     });
-    if (!res.ok) throw new Error('Failed to upload additional photo');
+    if (!res.ok) throw new Error(await extractErrorMessage(res, 'Failed to upload additional photo'));
     return res.json();
   }
 };

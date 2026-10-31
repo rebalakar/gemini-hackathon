@@ -1,6 +1,6 @@
 import React from 'react';
 import { Project, HealthInfo } from '../types';
-import { Layers, Sparkles, CheckCircle2, Clock, Plus, Beaker, FileSpreadsheet } from 'lucide-react';
+import { Layers, Sparkles, CheckCircle2, Clock, Plus, Beaker, FileSpreadsheet, KeyRound } from 'lucide-react';
 
 interface HeaderProps {
   currentProject: Project | null;
@@ -10,6 +10,7 @@ interface HeaderProps {
   onCreateProject: () => void;
   onLoadDemo: () => void;
   onOpenChecklist: () => void;
+  onOpenApiKeyModal: () => void;
   isSaving: boolean;
 }
 
@@ -21,6 +22,7 @@ export const Header: React.FC<HeaderProps> = ({
   onCreateProject,
   onLoadDemo,
   onOpenChecklist,
+  onOpenApiKeyModal,
   isSaving
 }) => {
   return (
@@ -57,14 +59,17 @@ export const Header: React.FC<HeaderProps> = ({
           </select>
 
           <button
+            type="button"
             onClick={onCreateProject}
-            title="Create New Project"
-            className="p-1.5 rounded-md hover:bg-parchment-200 text-charcoal-600 transition"
+            title="Create New Project for Camera or Photo Upload"
+            className="flex items-center space-x-1 bg-white hover:bg-parchment-200 text-charcoal-700 border border-parchment-300 text-xs px-2.5 py-1.5 rounded-md font-semibold transition shadow-2xs"
           >
-            <Plus className="w-4 h-4" />
+            <Plus className="w-3.5 h-3.5 text-terracotta-600" />
+            <span>New Project</span>
           </button>
 
           <button
+            type="button"
             onClick={onLoadDemo}
             className="flex items-center space-x-1.5 bg-terracotta-50 hover:bg-terracotta-100 text-terracotta-700 border border-terracotta-300 text-xs px-2.5 py-1.5 rounded-md font-semibold transition shadow-xs"
           >
@@ -88,16 +93,31 @@ export const Header: React.FC<HeaderProps> = ({
           )}
         </div>
 
-        {/* AI Adapter Mode */}
-        <div className="text-xs flex items-center space-x-1.5 px-2.5 py-1 rounded bg-white border border-parchment-300 font-mono shadow-2xs">
-          <Sparkles className={`w-3.5 h-3.5 ${health?.gemini_available ? 'text-purple-600' : 'text-charcoal-400'}`} />
-          <span className="text-charcoal-600 text-[11px]">
-            {health?.gemini_available ? `Gemini Active (${health.gemini_model})` : 'Offline Deterministic CV'}
-          </span>
+        {/* AI Adapter Mode & Quick Key Button */}
+        <div className="flex items-center space-x-1.5">
+          <button
+            type="button"
+            onClick={onOpenApiKeyModal}
+            title="Click to paste or configure Gemini API key"
+            className="text-xs flex items-center space-x-1.5 px-2.5 py-1 rounded bg-white hover:bg-parchment-200 border border-parchment-300 font-mono shadow-2xs transition cursor-pointer"
+          >
+            <Sparkles className={`w-3.5 h-3.5 ${health?.gemini_available ? 'text-purple-600' : 'text-charcoal-400'}`} />
+            <span className="text-charcoal-700 text-[11px] font-medium">
+              {health?.gemini_available ? `Gemini Active (${health.gemini_model})` : 'Offline CV Mode'}
+            </span>
+            <span className={`text-[10px] px-1.5 py-0.2 rounded font-semibold ${
+              health?.gemini_available
+                ? 'bg-purple-100 text-purple-700 border border-purple-200'
+                : 'bg-amber-50 text-amber-700 border border-amber-200'
+            }`}>
+              {health?.gemini_available ? 'Configured' : '+ Add Key'}
+            </span>
+          </button>
         </div>
 
         {/* Evaluation Checklist */}
         <button
+          type="button"
           onClick={onOpenChecklist}
           className="text-xs flex items-center space-x-1 text-charcoal-600 hover:text-charcoal-900 px-2 py-1 rounded hover:bg-parchment-200 transition"
         >

@@ -25,6 +25,8 @@ def init_db():
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
             description TEXT,
+            mode TEXT DEFAULT 'ceramic',
+            demo_type TEXT,
             status TEXT DEFAULT 'draft',
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
@@ -32,7 +34,8 @@ def init_db():
             reviewer_name TEXT,
             calibration_json TEXT,
             primary_photo_url TEXT,
-            primary_photo_dimensions TEXT
+            primary_photo_dimensions TEXT,
+            assembly_metadata_json TEXT
         );
 
         CREATE TABLE IF NOT EXISTS photographs (
@@ -100,6 +103,10 @@ def init_db():
             tangent_score REAL NOT NULL,
             overlap_penalty REAL NOT NULL,
             compatibility_score REAL NOT NULL,
+            seam_color_score REAL,
+            is_ambiguous INTEGER DEFAULT 0,
+            ambiguity_warning TEXT,
+            rank_for_pair INTEGER DEFAULT 1,
             status TEXT DEFAULT 'suggested',
             explanation TEXT NOT NULL,
             FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
@@ -141,10 +148,35 @@ def init_db():
             FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
         );
         """)
+        # Backward-compatible schema migrations for existing SQLite databases
+        migration_cols = [
+            "ALTER TABLE projects ADD COLUMN mode TEXT DEFAULT 'ceramic'",
+            "ALTER TABLE projects ADD COLUMN demo_type TEXT",
+            "ALTER TABLE projects ADD COLUMN assembly_metadata_json TEXT",
+            "ALTER TABLE join_candidates ADD COLUMN seam_color_score REAL",
+            "ALTER TABLE join_candidates ADD COLUMN is_ambiguous INTEGER DEFAULT 0",
+            "ALTER TABLE join_candidates ADD COLUMN ambiguity_warning TEXT",
+            "ALTER TABLE join_candidates ADD COLUMN rank_for_pair INTEGER DEFAULT 1",
+        ]
+        for sql in migration_cols:
+            try:
+                conn.execute(sql)
+            except Exception:
+                pass
     conn.close()
 
 # Database helper functions
 class Database:
+    @staticmethod
+    def clear_project_analysis(project_id: str):
+        """Clears fragments, vessel groups, and join candidates when a new primary photo is uploaded."""
+        conn = get_db_connection()
+        with conn:
+            conn.execute("DELETE FROM join_candidates WHERE project_id = ?", (project_id,))
+            conn.execute("DELETE FROM vessel_groups WHERE project_id = ?", (project_id,))
+            conn.execute("DELETE FROM fragments WHERE project_id = ?", (project_id,))
+        conn.close()
+
     @staticmethod
     def get_all_projects() -> List[Dict[str, Any]]:
         conn = get_db_connection()
@@ -152,8 +184,11 @@ class Database:
         projects = []
         for r in rows:
             p_dict = dict(r)
+            p_dict["mode"] = p_dict.get("mode") or "ceramic"
+            p_dict["demo_type"] = p_dict.get("demo_type")
             p_dict["calibration"] = json.loads(r["calibration_json"]) if r["calibration_json"] else CalibrationData().dict()
             p_dict["primary_photo_dimensions"] = json.loads(r["primary_photo_dimensions"]) if r["primary_photo_dimensions"] else None
+            p_dict["assembly_metadata"] = json.loads(p_dict["assembly_metadata_json"]) if p_dict.get("assembly_metadata_json") else None
             projects.append(p_dict)
         conn.close()
         return projects
@@ -166,8 +201,11 @@ class Database:
             conn.close()
             return None
         p_dict = dict(row)
+        p_dict["mode"] = p_dict.get("mode") or "ceramic"
+        p_dict["demo_type"] = p_dict.get("demo_type")
         p_dict["calibration"] = json.loads(row["calibration_json"]) if row["calibration_json"] else CalibrationData().dict()
         p_dict["primary_photo_dimensions"] = json.loads(row["primary_photo_dimensions"]) if row["primary_photo_dimensions"] else None
+        p_dict["assembly_metadata"] = json.loads(p_dict["assembly_metadata_json"]) if p_dict.get("assembly_metadata_json") else None
         conn.close()
         return p_dict
 
@@ -177,27 +215,41 @@ class Database:
         with conn:
             conn.execute("""
             INSERT INTO projects (
-                id, name, description, status, created_at, updated_at,
+                id, name, description, mode, demo_type, status, created_at, updated_at,
                 approved_at, reviewer_name, calibration_json,
-                primary_photo_url, primary_photo_dimensions
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                primary_photo_url, primary_photo_dimensions, assembly_metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
                 description = excluded.description,
+                mode = excluded.mode,
+                demo_type = excluded.demo_type,
                 status = excluded.status,
                 updated_at = excluded.updated_at,
                 approved_at = excluded.approved_at,
                 reviewer_name = excluded.reviewer_name,
                 calibration_json = excluded.calibration_json,
                 primary_photo_url = excluded.primary_photo_url,
-                primary_photo_dimensions = excluded.primary_photo_dimensions;
+                primary_photo_dimensions = excluded.primary_photo_dimensions,
+                assembly_metadata_json = excluded.assembly_metadata_json;
             """, (
-                project.id, project.name, project.description, project.status,
+                project.id, project.name, project.description, project.mode or "ceramic",
+                project.demo_type, project.status,
                 project.created_at, project.updated_at, project.approved_at,
                 project.reviewer_name, json.dumps(project.calibration.dict()),
                 project.primary_photo_url,
-                json.dumps(project.primary_photo_dimensions) if project.primary_photo_dimensions else None
+                json.dumps(project.primary_photo_dimensions) if project.primary_photo_dimensions else None,
+                json.dumps(project.assembly_metadata) if project.assembly_metadata else None
             ))
+        conn.close()
+
+    @staticmethod
+    def clear_project_detection_state(project_id: str):
+        conn = get_db_connection()
+        with conn:
+            conn.execute("DELETE FROM fragments WHERE project_id = ?", (project_id,))
+            conn.execute("DELETE FROM vessel_groups WHERE project_id = ?", (project_id,))
+            conn.execute("DELETE FROM join_candidates WHERE project_id = ?", (project_id,))
         conn.close()
 
     @staticmethod
@@ -226,6 +278,11 @@ class Database:
                 features=json.loads(r["features_json"] or '{}')
             ))
         conn.close()
+        def _sort_key(f: Fragment):
+            digits = "".join(ch for ch in f.id if ch.isdigit())
+            prefix = "".join(ch for ch in f.id if not ch.isdigit())
+            return (prefix, int(digits) if digits else 9999, f.id)
+        frags.sort(key=_sort_key)
         return frags
 
     @staticmethod
@@ -316,6 +373,7 @@ class Database:
         rows = conn.execute("SELECT * FROM join_candidates WHERE project_id = ? ORDER BY compatibility_score DESC", (project_id,)).fetchall()
         candidates = []
         for r in rows:
+            r_dict = dict(r)
             candidates.append(JoinCandidate(
                 id=r["id"],
                 project_id=r["project_id"],
@@ -335,6 +393,10 @@ class Database:
                 tangent_score=r["tangent_score"],
                 overlap_penalty=r["overlap_penalty"],
                 compatibility_score=r["compatibility_score"],
+                seam_color_score=r_dict.get("seam_color_score"),
+                is_ambiguous=bool(r_dict.get("is_ambiguous", 0)),
+                ambiguity_warning=r_dict.get("ambiguity_warning"),
+                rank_for_pair=int(r_dict.get("rank_for_pair") or 1),
                 status=r["status"],
                 explanation=r["explanation"]
             ))
@@ -342,9 +404,11 @@ class Database:
         return candidates
 
     @staticmethod
-    def save_join_candidates(project_id: str, joins: List[JoinCandidate]):
+    def save_join_candidates(project_id: str, joins: List[JoinCandidate], replace_all: bool = False):
         conn = get_db_connection()
         with conn:
+            if replace_all:
+                conn.execute("DELETE FROM join_candidates WHERE project_id = ?", (project_id,))
             for j in joins:
                 conn.execute("""
                 INSERT INTO join_candidates (
@@ -353,17 +417,35 @@ class Database:
                     segment_a_points_json, segment_b_points_json,
                     transform_rotation_deg, transform_tx, transform_ty,
                     residual_px, residual_mm, matched_length_px, matched_length_mm,
-                    tangent_score, overlap_penalty, compatibility_score, status, explanation
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    tangent_score, overlap_penalty, compatibility_score,
+                    seam_color_score, is_ambiguous, ambiguity_warning, rank_for_pair,
+                    status, explanation
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
-                    status = excluded.status;
+                    transform_rotation_deg = excluded.transform_rotation_deg,
+                    transform_tx = excluded.transform_tx,
+                    transform_ty = excluded.transform_ty,
+                    residual_px = excluded.residual_px,
+                    matched_length_px = excluded.matched_length_px,
+                    tangent_score = excluded.tangent_score,
+                    overlap_penalty = excluded.overlap_penalty,
+                    compatibility_score = excluded.compatibility_score,
+                    seam_color_score = excluded.seam_color_score,
+                    is_ambiguous = excluded.is_ambiguous,
+                    ambiguity_warning = excluded.ambiguity_warning,
+                    rank_for_pair = excluded.rank_for_pair,
+                    status = excluded.status,
+                    explanation = excluded.explanation;
                 """, (
                     j.id, j.project_id, j.fragment_a_id, j.fragment_b_id,
                     json.dumps(j.segment_a_indices), json.dumps(j.segment_b_indices),
                     json.dumps(j.segment_a_points), json.dumps(j.segment_b_points),
                     j.transform_rotation_deg, j.transform_tx, j.transform_ty,
                     j.residual_px, j.residual_mm, j.matched_length_px, j.matched_length_mm,
-                    j.tangent_score, j.overlap_penalty, j.compatibility_score, j.status, j.explanation
+                    tangent_score if (tangent_score := j.tangent_score) is not None else 0.0,
+                    j.overlap_penalty, j.compatibility_score,
+                    j.seam_color_score, 1 if j.is_ambiguous else 0, j.ambiguity_warning, j.rank_for_pair,
+                    j.status, j.explanation
                 ))
         conn.close()
 

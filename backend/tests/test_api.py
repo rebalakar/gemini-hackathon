@@ -1,6 +1,8 @@
+import io
 import pytest
 from fastapi.testclient import TestClient
 from app.main import app
+from app.synthetic_data import create_synthetic_scene_image
 
 client = TestClient(app)
 
@@ -10,6 +12,51 @@ def test_api_health():
     data = res.json()
     assert data["app"] == "SHERD-FORGE"
     assert "gemini_available" in data
+
+def test_api_photo_and_camera_upload(tmp_path):
+    # 1. Create a new empty project
+    proj_res = client.post("/api/projects", data={"name": "Field Excavation Upload Test", "description": "Testing upload and camera"})
+    assert proj_res.status_code == 200
+    proj_id = proj_res.json()["id"]
+
+    # 2. Generate a valid test image on disk
+    img_path = tmp_path / "upload_scene.png"
+    create_synthetic_scene_image(img_path)
+    img_bytes = img_path.read_bytes()
+
+    # 3. Upload overhead photo via /upload-photo
+    up_res = client.post(
+        f"/api/projects/{proj_id}/upload-photo",
+        files={"file": ("field_table.png", io.BytesIO(img_bytes), "image/png")}
+    )
+    assert up_res.status_code == 200
+    up_data = up_res.json()
+    assert up_data["primary_photo_url"].startswith("/uploads/")
+    assert up_data["dimensions"] == [1600, 1200]
+    assert len(up_data["fragments"]) >= 7
+    assert len(up_data["groups"]) >= 2
+
+    # 4. Upload camera blob without file extension in filename (relying on content_type)
+    cam_res = client.post(
+        f"/api/projects/{proj_id}/upload-photo",
+        files={"file": ("blob", io.BytesIO(img_bytes), "image/png")}
+    )
+    assert cam_res.status_code == 200
+    cam_data = cam_res.json()
+    assert cam_data["primary_photo_url"].startswith("/uploads/")
+    assert len(cam_data["fragments"]) >= 7
+
+    # 5. Upload additional fragment photo (e.g. fracture view)
+    add_res = client.post(
+        f"/api/projects/{proj_id}/additional-photos",
+        data={"fragment_id": "S1", "role": "fracture", "notes": "Fracture profile"},
+        files={"file": ("camera_fracture.png", io.BytesIO(img_bytes), "image/png")}
+    )
+    assert add_res.status_code == 200
+    add_data = add_res.json()
+    assert add_data["role"] == "fracture"
+    assert add_data["fragment_id"] == "S1"
+    assert add_data["file_url"].startswith("/uploads/")
 
 def test_api_full_synthetic_workflow():
     # 1. Create turnkey synthetic demo project

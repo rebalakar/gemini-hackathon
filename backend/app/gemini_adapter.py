@@ -1,12 +1,13 @@
 import os
 import json
+import base64
 from typing import Dict, Any, Optional, List
 from .config import GEMINI_API_KEY, GEMINI_MODEL
 
 class GeminiAdapter:
     def __init__(self):
         self.api_key = GEMINI_API_KEY
-        self.model_name = GEMINI_MODEL
+        self.model_name = GEMINI_MODEL or "gemini-4-argon"
         self._client = None
         if self.api_key:
             try:
@@ -18,6 +19,45 @@ class GeminiAdapter:
 
     def is_available(self) -> bool:
         return self._client is not None and bool(self.api_key)
+
+    def set_api_key(self, api_key: str, model_name: Optional[str] = None) -> bool:
+        """
+        Dynamically updates the Gemini API key (and optionally model) in memory.
+        """
+        api_key = api_key.strip()
+        if not api_key:
+            self.api_key = ""
+            self._client = None
+            return False
+        self.api_key = api_key
+        if model_name:
+            self.model_name = model_name.strip()
+        try:
+            from google import genai
+            self._client = genai.Client(api_key=self.api_key)
+            return True
+        except Exception as e:
+            print(f"[GeminiAdapter] Initialization error with provided key: {e}")
+            self._client = None
+            return False
+
+    @staticmethod
+    def _extract_interaction_text(interaction: Any) -> str:
+        if getattr(interaction, "output_text", None):
+            return interaction.output_text.strip()
+        if hasattr(interaction, "steps") and interaction.steps:
+            for step in reversed(interaction.steps):
+                if getattr(step, "type", None) == "model_output" and getattr(step, "content", None):
+                    for part in step.content:
+                        if getattr(part, "text", None):
+                            return part.text.strip()
+        if hasattr(interaction, "outputs") and interaction.outputs:
+            for out in reversed(interaction.outputs):
+                if getattr(out, "text", None):
+                    return out.text.strip()
+        if hasattr(interaction, "text") and interaction.text:
+            return interaction.text.strip()
+        return ""
 
     def analyze_fragment(self, image_bytes: bytes, mime_type: str = "image/png") -> Dict[str, Any]:
         """
@@ -44,16 +84,24 @@ class GeminiAdapter:
         )
 
         try:
-            from google.genai import types
-            response = self._client.models.generate_content(
+            b64_data = base64.b64encode(image_bytes).decode("ascii")
+            interaction = self._client.interactions.create(
                 model=self.model_name,
-                contents=[
-                    types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
-                    prompt
-                ]
+                input=[
+                    {
+                        "type": "image",
+                        "data": b64_data,
+                        "mime_type": mime_type,
+                    },
+                    {
+                        "type": "text",
+                        "text": prompt,
+                    },
+                ],
+                generation_config={"thinking_level": "low"},
             )
 
-            text = response.text.strip()
+            text = self._extract_interaction_text(interaction)
             # Clean markdown code block formatting if present
             if text.startswith("```"):
                 lines = text.splitlines()
@@ -99,11 +147,12 @@ class GeminiAdapter:
         )
 
         try:
-            response = self._client.models.generate_content(
+            interaction = self._client.interactions.create(
                 model=self.model_name,
-                contents=[prompt]
+                input=prompt,
+                generation_config={"thinking_level": "medium"},
             )
-            text = response.text.strip()
+            text = self._extract_interaction_text(interaction)
             if text.startswith("```"):
                 lines = text.splitlines()
                 if lines[0].startswith("```"):
